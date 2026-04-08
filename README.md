@@ -23,7 +23,7 @@
 
 边缘设备通过组合不确定性度量，**只上传约 15% 的最困难样本**：
 
-$$U(x) = \max\left\{\frac{H(x)}{\log C},\ \frac{D_{KL}(x)}{D_{KL}^{ref}}\right\}$$
+$$U(x) = \max\Bigl(\frac{H(x)}{\log C},\ \frac{D_{KL}(x)}{D_{KL}^{ref}}\Bigr)$$
 
 - **预测熵** H(x)：按置信度和面积加权，归一化到 [0,1]
 - **特征KL散度** D_KL(x)：目标域特征分布与源域分布的散度
