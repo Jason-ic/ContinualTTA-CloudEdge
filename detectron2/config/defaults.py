@@ -712,11 +712,22 @@ _C.TEST.ADAPTATION.CLOUD_ITERATIONS = 1000
 
 # Knowledge Distillation
 _C.TEST.ADAPTATION.DISTILL_LR = 0.001
-_C.TEST.ADAPTATION.DISTILL_EPOCHS = 10
-_C.TEST.ADAPTATION.LAMBDA_FEATURE = 1.0
-_C.TEST.ADAPTATION.LAMBDA_OUTPUT = 1.0
-_C.TEST.ADAPTATION.DISTILL_TEMPERATURE = 2.0
+_C.TEST.ADAPTATION.DISTILL_EPOCHS = 4        # 论文 3-5 epochs，默认4
+_C.TEST.ADAPTATION.LAMBDA_FEATURE = 0.5      # lambda_feat，论文默认0.5
+_C.TEST.ADAPTATION.LAMBDA_OUTPUT = 1.0       # lambda_cls，论文默认1.0
+_C.TEST.ADAPTATION.LAMBDA_REG = 0.5          # lambda_reg，论文默认0.5
+_C.TEST.ADAPTATION.DISTILL_TEMPERATURE = 3.0 # 蒸馏温度，论文默认3
 _C.TEST.ADAPTATION.DISTILL_STAGES = ["res2", "res3", "res4", "res5"]
+
+# Forgetting Regularization
+_C.TEST.ADAPTATION.FORGETTING_BETA = 0.3     # 防遗忘正则强度，论文 [0.1, 0.5]
+_C.TEST.ADAPTATION.ROLLBACK_THRESHOLD = 5.0  # mAP下降触发回滚阈值（百分点）
+
+# Uncertainty Sampling (Edge-side)
+_C.TEST.ADAPTATION.UNCERTAINTY_PERCENTILE = 0.7   # 滑动窗口百分位阈值 p
+_C.TEST.ADAPTATION.SLIDING_WINDOW_SIZE = 100       # 滑动窗口大小 W
+_C.TEST.ADAPTATION.KL_REF = 1.0                    # KL散度归一化参考值
+_C.TEST.ADAPTATION.S_MIN = 1024.0                  # 最小proposal面积 (32*32)
 
 # ---------------------------------------------------------------------------- #
 # Cloud-Edge Communication

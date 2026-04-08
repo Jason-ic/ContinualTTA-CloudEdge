@@ -159,6 +159,96 @@ def configure_model(cfg, trainer, model=None, revert=True, lr=None, weight_path=
         model.roi_heads.training = True
     else:
         teacher_model = None
-    
+
     return model, optimizer, teacher_model
+
+
+# ---------------------------------------------------------------------------- #
+# 云边协同模型配置
+# ---------------------------------------------------------------------------- #
+
+def configure_cloud_edge_models(cfg, trainer):
+    """
+    构建云边协同框架所需的教师(R101+LoRA)和学生(R50)模型。
+
+    教师模型: ResNet-101-FPN，注入LoRA (rank=16)
+              仅LoRA参数可训练，AdamW lr=2e-3
+    学生模型: ResNet-50-FPN，全参数可训练
+              AdamW lr=1e-3
+
+    Args:
+        cfg: 配置节点（需包含 TEST.ADAPTATION.CLOUD_MODEL_WEIGHTS 等键）
+        trainer: DefaultTrainer 实例（用于 build_model）
+    Returns:
+        CloudDistillationTrainer 实例
+    """
+    from detectron2.modeling.cloud_distillation import CloudDistillationTrainer, inject_lora_to_model
+    import copy
+
+    # --- 构建教师模型（R101）---
+    # 覆盖 backbone 配置为 R101
+    teacher_cfg = cfg.clone()
+    teacher_cfg.defrost()
+    # 若云端模型权重已指定则使用，否则复用边端权重
+    if cfg.TEST.ADAPTATION.CLOUD_MODEL_WEIGHTS is not None:
+        teacher_cfg.MODEL.WEIGHTS = cfg.TEST.ADAPTATION.CLOUD_MODEL_WEIGHTS
+    # 将 backbone 修改为 R101（假定配置中有对应的 R101 config）
+    # 用户可通过 CloudEdge_COCO_R101_R50.yaml 传入正确的 R101 backbone 名
+    teacher_cfg.freeze()
+
+    teacher_model = trainer.build_model(teacher_cfg)
+    from detectron2.checkpoint import DetectionCheckpointer
+    DetectionCheckpointer(teacher_model).resume_or_load(
+        teacher_cfg.MODEL.WEIGHTS, resume=False
+    )
+    teacher_model.eval()
+    teacher_model.requires_grad_(False)
+    teacher_model.initialize()
+
+    # 保存一份冻结的预训练教师（用于防遗忘正则）
+    pretrain_teacher = copy.deepcopy(teacher_model)
+    pretrain_teacher.eval()
+    pretrain_teacher.requires_grad_(False)
+
+    # 注入 LoRA
+    lora_rank = 16
+    teacher_model, lora_params = inject_lora_to_model(
+        teacher_model, r=lora_rank, lora_alpha=lora_rank
+    )
+
+    # --- 构建学生模型（R50, 与边端相同）---
+    student_model = trainer.build_model(cfg)
+    DetectionCheckpointer(student_model).resume_or_load(
+        cfg.MODEL.WEIGHTS, resume=False
+    )
+    student_model.eval()
+    student_model.requires_grad_(True)
+    student_model.initialize()
+
+    # --- 构建 CloudDistillationTrainer ---
+    distill_trainer = CloudDistillationTrainer(
+        teacher_model=teacher_model,
+        student_model=student_model,
+        pretrain_teacher=pretrain_teacher,
+        teacher_lr=cfg.TEST.ADAPTATION.CLOUD_LORA_LR,
+        teacher_weight_decay=1e-4,
+        student_lr=cfg.TEST.ADAPTATION.DISTILL_LR,
+        teacher_epochs=max(1, cfg.TEST.ADAPTATION.CLOUD_ITERATIONS // 100),
+        student_epochs=cfg.TEST.ADAPTATION.DISTILL_EPOCHS,
+        forgetting_beta=getattr(cfg.TEST.ADAPTATION, 'FORGETTING_BETA', 0.3),
+        rollback_threshold=getattr(cfg.TEST.ADAPTATION, 'ROLLBACK_THRESHOLD', 5.0),
+        lambda_cls=cfg.TEST.ADAPTATION.LAMBDA_OUTPUT,
+        lambda_reg=getattr(cfg.TEST.ADAPTATION, 'LAMBDA_REG', 0.5),
+        lambda_feat=cfg.TEST.ADAPTATION.LAMBDA_FEATURE,
+        distill_temperature=cfg.TEST.ADAPTATION.DISTILL_TEMPERATURE,
+        lora_rank=lora_rank,
+    )
+    # teacher LoRA 优化器已通过 inject_lora 完成，这里直接设置
+    distill_trainer.teacher_optimizer = torch.optim.AdamW(
+        lora_params,
+        lr=cfg.TEST.ADAPTATION.CLOUD_LORA_LR,
+        weight_decay=1e-4,
+    )
+
+    return distill_trainer
 

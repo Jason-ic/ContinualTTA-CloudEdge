@@ -1,0 +1,78 @@
+# 云边协同框架配置
+# Cloud-Edge Collaborative TTA Configuration
+# 教师模型: ResNet-101-FPN (云端) + LoRA (rank=16)
+# 学生/边端模型: ResNet-50-FPN
+# 参考: 论文《云边协同框架下持续动态的测试时自适应目标检测算法研究》
+
+_BASE_: "../Base/COCO_faster_rcnn_R50_FPN_1x.yaml"
+
+MODEL:
+  # 边端/学生模型权重 (ResNet-50)
+  WEIGHTS: "./outputs/coco_base_r50/model_final.pth"
+
+SOLVER:
+  IMS_PER_BATCH_TEST: 4
+  BASE_LR: 0.001
+  TYPE: "AdamW"
+  CLIP_GRADIENTS:
+    ENABLED: True
+    CLIP_VALUE: 1.0
+
+TEST:
+  ONLINE_ADAPTATION: True
+  CONTINUAL_DOMAIN: True
+  ADAPTATION:
+    # 基础 TTA 设置（边端持续适配）
+    CONTINUAL: True
+    SOURCE_FEATS_PATH: "./models/stats/COCO_R50_stats.pt"
+    GLOBAL_ALIGN: "KL"
+    FOREGROUND_ALIGN: "KL"
+    ALPHA_GLOBAL: 1.0
+    ALPHA_FOREGROUND: 1.0
+    WEIGHT_REG: 0.0
+    TH_BG: 0.5
+    EMA_GAMMA: 128
+    FREQ_WEIGHT: True
+    WHERE: "adapter"
+
+    # 云边协同开关
+    ENABLE_CLOUD_EDGE: True
+    EDGE_MODEL: "R50"
+    CLOUD_MODEL: "R101"
+    CLOUD_MODEL_WEIGHTS: "./outputs/coco_base_r101/model_final.pth"
+
+    # 不确定性采样（边端）
+    UNCERTAINTY_PERCENTILE: 0.7      # 选择不确定性 >= 70 百分位的样本上传
+    SLIDING_WINDOW_SIZE: 100         # 滑动窗口大小
+    KL_REF: 1.0                      # KL散度归一化参考值
+    S_MIN: 1024.0                    # 最小proposal面积 32x32
+    SELECTION_METHOD: "combined"     # entropy+KL组合
+
+    # 云端教师LoRA训练
+    CLOUD_BASE_LR: 0.002             # 教师 AdamW lr=2e-3
+    CLOUD_LORA_LR: 0.002
+    CLOUD_BATCH_SIZE: 8
+    CLOUD_ITERATIONS: 200            # ~2 epochs on uploaded samples
+
+    # 知识蒸馏（云端学生训练）
+    DISTILL_LR: 0.001                # 学生 AdamW lr=1e-3
+    DISTILL_EPOCHS: 4                # 论文 3-5 epochs
+    DISTILL_TEMPERATURE: 3.0         # 温度 T=3
+    LAMBDA_OUTPUT: 1.0               # lambda_cls
+    LAMBDA_REG: 0.5                  # lambda_reg
+    LAMBDA_FEATURE: 0.5              # lambda_feat
+
+    # 防遗忘与回滚
+    FORGETTING_BETA: 0.3             # 防遗忘正则强度
+    ROLLBACK_THRESHOLD: 5.0          # mAP下降超过5pp触发回滚
+
+  ADAPTER:
+    TYPE: "parallel"
+
+CLOUD_EDGE:
+  EDGE_DIR: "./outputs/cloud_edge/edge"
+  CLOUD_DIR: "./outputs/cloud_edge/cloud"
+  COMPRESSION_LEVEL: 6
+  CLEANUP_KEEP_N: 5
+
+OUTPUT_DIR: "./outputs/CloudEdge_COCO_R101_R50"
