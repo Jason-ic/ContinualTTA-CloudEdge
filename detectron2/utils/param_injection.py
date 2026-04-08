@@ -55,10 +55,15 @@ def export_student_fp16(
     for key, param in model.state_dict().items():
         fp16_state[key] = param.half()
 
+    # 先写临时文件再 rename，避免并发写入 crash
+    tmp_path = save_path + '.tmp'
     if state_dict_only:
-        torch.save(fp16_state, save_path)
+        torch.save(fp16_state, tmp_path)
     else:
-        torch.save({'state_dict': fp16_state, 'model_class': type(model).__name__}, save_path)
+        torch.save({'state_dict': fp16_state, 'model_class': type(model).__name__}, tmp_path)
+    if os.path.exists(save_path):
+        os.remove(save_path)
+    os.rename(tmp_path, save_path)
 
     # 计算MD5
     md5 = _compute_md5(save_path)
@@ -116,7 +121,7 @@ def mmap_load_state_dict(
         buffer = io.BytesIO(mm.read())
         mm.close()
 
-    state_dict = torch.load(buffer, map_location='cpu', weights_only=True)
+    state_dict = torch.load(buffer, map_location='cpu')
 
     # 精度转换
     if target_dtype != torch.float16:

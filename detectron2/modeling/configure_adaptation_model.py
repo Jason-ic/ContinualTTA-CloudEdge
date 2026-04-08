@@ -185,15 +185,17 @@ def configure_cloud_edge_models(cfg, trainer):
     from detectron2.modeling.cloud_distillation import CloudDistillationTrainer, inject_lora_to_model
     import copy
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
     # --- 构建教师模型（R101）---
     # 覆盖 backbone 配置为 R101
     teacher_cfg = cfg.clone()
     teacher_cfg.defrost()
+    # 将 backbone 修改为 R101
+    teacher_cfg.MODEL.RESNETS.DEPTH = 101
     # 若云端模型权重已指定则使用，否则复用边端权重
     if cfg.TEST.ADAPTATION.CLOUD_MODEL_WEIGHTS is not None:
         teacher_cfg.MODEL.WEIGHTS = cfg.TEST.ADAPTATION.CLOUD_MODEL_WEIGHTS
-    # 将 backbone 修改为 R101（假定配置中有对应的 R101 config）
-    # 用户可通过 CloudEdge_COCO_R101_R50.yaml 传入正确的 R101 backbone 名
     teacher_cfg.freeze()
 
     teacher_model = trainer.build_model(teacher_cfg)
@@ -207,6 +209,7 @@ def configure_cloud_edge_models(cfg, trainer):
 
     # 保存一份冻结的预训练教师（用于防遗忘正则）
     pretrain_teacher = copy.deepcopy(teacher_model)
+    pretrain_teacher.to(device)
     pretrain_teacher.eval()
     pretrain_teacher.requires_grad_(False)
 
@@ -215,12 +218,17 @@ def configure_cloud_edge_models(cfg, trainer):
     teacher_model, lora_params = inject_lora_to_model(
         teacher_model, r=lora_rank, lora_alpha=lora_rank
     )
+    # 确保 LoRA 参数可训练
+    for p in lora_params:
+        p.requires_grad_(True)
+    teacher_model.to(device)
 
     # --- 构建学生模型（R50, 与边端相同）---
     student_model = trainer.build_model(cfg)
     DetectionCheckpointer(student_model).resume_or_load(
         cfg.MODEL.WEIGHTS, resume=False
     )
+    student_model.to(device)
     student_model.eval()
     student_model.requires_grad_(True)
     student_model.initialize()

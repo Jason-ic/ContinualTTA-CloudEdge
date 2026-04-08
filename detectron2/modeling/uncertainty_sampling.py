@@ -108,39 +108,38 @@ class UncertaintySampler:
 
     def compute_feature_kl(
         self,
-        target_feat_mean: torch.Tensor,  # (D,)
-        target_feat_var: torch.Tensor,   # (D,)
+        target_feat_dict: dict,
     ) -> float:
         """
-        计算目标域特征分布与源域分布之间的对角KL散度。
-        D_KL(N(mu_T, diag(var_T)) || N(mu_S, diag(var_S)))
+        计算目标域特征分布与源域分布之间的KL散度（按FPN层级平均）。
 
         Args:
-            target_feat_mean: 当前批次特征均值
-            target_feat_var: 当前批次特征方差
+            target_feat_dict: 按层级的特征字典 {'p2': tensor(C,), ...}
         Returns:
             KL散度标量
         """
         if self.source_feat_stats is None:
             return 0.0
 
-        mu_s = self.source_feat_stats['global'][0].to(target_feat_mean.device)
-        var_s = self.source_feat_stats['global'][1].to(target_feat_mean.device)
+        gl_stats = self.source_feat_stats['gl']
+        kl_sum = 0.0
+        count = 0
 
-        # 对角高斯KL散度（闭式解）
-        # KL(N1||N2) = 0.5 * sum[ log(var2/var1) + var1/var2 + (mu1-mu2)^2/var2 - 1 ]
-        eps = 1e-8
-        var_s = var_s.clamp(min=eps)
-        var_t = target_feat_var.clamp(min=eps)
+        for key, target_mean in target_feat_dict.items():
+            if key not in gl_stats:
+                continue
+            mu_s = gl_stats[key][0].to(target_mean.device)  # (C,)
+            cov_s = gl_stats[key][1].to(target_mean.device)  # (C, C)
 
-        kl = 0.5 * (
-            (var_s / var_t).log()
-            + var_t / var_s
-            + (target_feat_mean - mu_s).pow(2) / var_s
-            - 1
-        ).sum().item()
+            # 用对角方差近似
+            var_s = cov_s.diag().clamp(min=1e-8)
+            diff = target_mean - mu_s
 
-        return max(kl, 0.0)
+            kl = 0.5 * (diff.pow(2) / var_s).sum().item()
+            kl_sum += max(kl, 0.0)
+            count += 1
+
+        return kl_sum / max(count, 1)
 
     def compute_combined_uncertainty(
         self,
@@ -183,8 +182,7 @@ class UncertaintySampler:
     def should_upload(
         self,
         class_scores: torch.Tensor,         # (N, C+1)
-        feat_mean: Optional[torch.Tensor],   # (D,)
-        feat_var: Optional[torch.Tensor],    # (D,)
+        feat_dict: Optional[dict] = None,   # {'p2': tensor, ...}
         proposal_areas: Optional[torch.Tensor] = None,  # (N,)
         pred_classes: Optional[List[int]] = None,
     ) -> Tuple[bool, float]:
@@ -200,8 +198,8 @@ class UncertaintySampler:
         entropy_score = self.compute_prediction_entropy(class_scores, proposal_areas)
 
         # 2. 计算特征KL散度
-        if feat_mean is not None and feat_var is not None:
-            kl_score = self.compute_feature_kl(feat_mean, feat_var)
+        if feat_dict is not None:
+            kl_score = self.compute_feature_kl(feat_dict)
         else:
             kl_score = 0.0
 
@@ -255,30 +253,18 @@ class UncertaintySampler:
         self.uncertainty_window.clear()
 
 
-def extract_image_features(model_features: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+def extract_image_features(model_features: Dict[str, torch.Tensor]) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
     """
-    从FPN特征字典中提取图像级全局特征（GAP后的均值和方差）。
-    取所有FPN层的平均。
+    从FPN特征字典中提取每层的GAP特征均值。
 
     Args:
         model_features: FPN特征字典，如 {'p2': ..., 'p3': ..., ...}
     Returns:
-        (feat_mean, feat_var): 全局特征统计，shape (D,)
+        按层级的特征字典 {'p2': (mean, var), 'p3': ...}
     """
-    gap_feats = []
+    result = {}
     for key in sorted(model_features.keys()):
         feat = model_features[key]  # (1, C, H, W)
         gap = feat.mean(dim=[2, 3]).squeeze(0)  # (C,)
-        gap_feats.append(gap)
-
-    if not gap_feats:
-        return None, None
-
-    # 取所有层级concat
-    all_feats = torch.cat(gap_feats, dim=0)  # (sum_C,)
-    # 由于单张图无法估计方差，用标准差近似（多个层级提供统计）
-    stacked = torch.stack(gap_feats, dim=0)  # (L, C)
-    feat_mean = stacked.mean(dim=0)
-    feat_var = stacked.var(dim=0) + 1e-8
-
-    return feat_mean.detach(), feat_var.detach()
+        result[key] = gap.detach()
+    return result

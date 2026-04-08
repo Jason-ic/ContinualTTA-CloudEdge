@@ -52,10 +52,10 @@ echo "================================================"
 python tools/cloud_edge_adapt.py \
     --config-file ${CONFIG} \
     --num-gpus ${NGPU} \
-    --cloud-update-interval 200 \
+    --cloud-update-interval 30 \
     OUTPUT_DIR "${OUTPUT_BASE}/cloud_edge_full" \
     TEST.ADAPTATION.ENABLE_CLOUD_EDGE True \
-    TEST.ADAPTATION.UNCERTAINTY_PERCENTILE 0.7
+    TEST.ADAPTATION.UNCERTAINTY_PERCENTILE 0.5
 
 # ============================================================
 # 实验4: 云边协同 - 消融：随机采样（不用不确定性）

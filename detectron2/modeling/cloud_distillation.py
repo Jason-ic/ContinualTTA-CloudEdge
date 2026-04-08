@@ -271,48 +271,78 @@ class CloudDistillationTrainer:
     def adapt_teacher(
         self,
         uploaded_batches: List[Dict],
-        align_loss_fn,  # 调用 model.adapt() 风格的损失函数
+        align_loss_fn=None,
     ) -> Dict[str, float]:
         """
         Phase 1: 教师 LoRA 适配。
-        使用上传的困难样本，调用教师模型的特征对齐方法更新 LoRA 参数。
+        直接前向计算特征，与源域统计量计算 KL 散度，梯度流过 LoRA。
 
         Args:
             uploaded_batches: 从边端上传的图像批次列表
-            align_loss_fn: callable(model, batch) -> loss_dict
+            align_loss_fn: 未使用，保留接口兼容
         Returns:
             平均损失字典
         """
-        self.teacher.train()
+        self.teacher.eval()  # 保持 eval 避免 RPN 要求 gt
+        # 确保 LoRA 参数有梯度
+        for p in self.teacher.parameters():
+            if 'lora_' in getattr(p, '_name', ''):
+                p.requires_grad_(True)
+
         total_losses = {}
         n = 0
+
+        # 获取源域统计（从教师模型）
+        s_stats = getattr(self.teacher, 's_stats', None)
+        if s_stats is None:
+            logger.warning("[CloudDistill] 教师模型无源域统计，跳过适配")
+            return {}
+
+        ema_gamma = getattr(self.teacher, 'ema_gamma', 128)
 
         for epoch in range(self.teacher_epochs):
             for batch in uploaded_batches:
                 self.teacher_optimizer.zero_grad()
 
-                # 特征对齐损失（调用 teacher.adapt()）
-                self.teacher.online_adapt = True
-                loss_dict = align_loss_fn(self.teacher, batch)
+                # 前向传播（梯度流过 LoRA）
+                images = self.teacher.preprocess_image(batch)
+                features = self.teacher.backbone(images.tensor)
+                if isinstance(features, tuple):
+                    features = features[0]
 
-                # 防遗忘正则
-                if self.pretrain_teacher is not None:
-                    # 简化：对当前batch前向传播计算遗忘损失
-                    pass  # 在更完整的实现中可扩展
+                # 全局特征对齐 KL 散度（不 detach，让梯度流过 LoRA）
+                align_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+                loss_count = 0
 
-                total_loss = sum(loss_dict.values())
-                if total_loss > 0 and not torch.isnan(torch.tensor(float(total_loss))):
-                    if isinstance(total_loss, torch.Tensor):
-                        total_loss.backward()
-                        torch.nn.utils.clip_grad_norm_(
-                            [p for p in self.teacher.parameters() if p.requires_grad],
-                            max_norm=1.0
-                        )
-                        self.teacher_optimizer.step()
+                if 'gl' in s_stats:
+                    for k in features:
+                        if k not in s_stats['gl']:
+                            continue
+                        # 当前批次特征均值（保留梯度）
+                        cur_feat = features[k].mean(dim=[2, 3]).mean(dim=0)  # (C,)
 
-                for k, v in loss_dict.items():
-                    val = v.item() if isinstance(v, torch.Tensor) else float(v)
-                    total_losses[k] = total_losses.get(k, 0.0) + val
+                        s_mean = s_stats['gl'][k][0].to(self.device)
+                        s_cov = s_stats['gl'][k][1].to(self.device)
+                        s_var = s_cov.diag().clamp(min=1e-8)
+
+                        # KL 散度（简化对角高斯）
+                        diff = cur_feat - s_mean
+                        kl = 0.5 * (diff.pow(2) / s_var).sum()
+                        align_loss = align_loss + kl
+                        loss_count += 1
+
+                if loss_count > 0:
+                    align_loss = align_loss / loss_count
+
+                if align_loss.requires_grad and not torch.isnan(align_loss):
+                    align_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for p in self.teacher.parameters() if p.requires_grad],
+                        max_norm=1.0
+                    )
+                    self.teacher_optimizer.step()
+
+                total_losses['align_kl'] = total_losses.get('align_kl', 0.0) + align_loss.item()
                 n += 1
 
         avg_losses = {k: v / max(n, 1) for k, v in total_losses.items()}
@@ -349,7 +379,7 @@ class CloudDistillationTrainer:
             )
 
             enhanced_batch = {
-                **batch,
+                'batch': batch,  # list[dict], 原始 detectron2 batch
                 'pseudo_logits': predictions[0].detach() if predictions else None,
                 'pseudo_bbox': predictions[1].detach() if len(predictions) > 1 else None,
                 'pseudo_features': {k: v.detach() for k, v in features.items()},
@@ -372,10 +402,14 @@ class CloudDistillationTrainer:
         Returns:
             平均损失字典
         """
-        # 设置学生模型可训练
+        # 设置学生模型可训练（保持 eval 模式避免 RPN 要求 gt）
         self.student.to(self.device)
-        self.student.train()
+        self.student.eval()
         self.student.requires_grad_(True)
+        # 手动开启 BN 训练模式
+        for m in self.student.modules():
+            if isinstance(m, (torch.nn.BatchNorm2d, torch.nn.SyncBatchNorm)):
+                m.train()
 
         if self.student_optimizer is None:
             self.student_optimizer = torch.optim.AdamW(
@@ -390,8 +424,9 @@ class CloudDistillationTrainer:
             for batch in enhanced_batches:
                 self.student_optimizer.zero_grad()
 
-                # 学生前向
-                images = self.student.preprocess_image(batch)
+                # 学生前向（用原始 batch）
+                raw_batch = batch['batch']
+                images = self.student.preprocess_image(raw_batch)
                 s_features = self.student.backbone(images.tensor)
                 if isinstance(s_features, tuple):
                     s_features = s_features[0]
@@ -408,6 +443,15 @@ class CloudDistillationTrainer:
 
                 s_logits = s_predictions[0] if s_predictions else None
                 s_bbox = s_predictions[1] if len(s_predictions) > 1 else None
+
+                # 对齐 proposal 数量（教师和学生可能不同）
+                if s_logits is not None and t_logits is not None:
+                    min_n = min(s_logits.shape[0], t_logits.shape[0])
+                    s_logits = s_logits[:min_n]
+                    t_logits = t_logits[:min_n]
+                    if s_bbox is not None and t_bbox is not None:
+                        s_bbox = s_bbox[:min_n]
+                        t_bbox = t_bbox[:min_n]
 
                 # 三级蒸馏损失
                 total_loss, loss_dict = self.distill_loss_fn(

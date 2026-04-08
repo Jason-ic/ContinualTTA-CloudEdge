@@ -176,42 +176,39 @@ class CloudEdgePipeline:
         self.frame_count += 1
         self.stats['total_frames'] += 1
 
-        # 边端前向推理
+        # 边端前向推理 + 特征对齐适配（adapt 返回 postprocessed results）
+        if self.edge_optimizer is not None:
+            self.edge_optimizer.zero_grad()
+
+        results, adapt_losses, _ = self.edge_model.adapt(batch)
+
+        if self.edge_optimizer is not None and adapt_losses:
+            loss = sum(adapt_losses.values())
+            if isinstance(loss, torch.Tensor) and loss.requires_grad:
+                loss.backward()
+                self.edge_optimizer.step()
+
+        # 提取特征和预测用于不确定性评估
         with torch.no_grad():
             images = self.edge_model.preprocess_image(batch)
             features = self.edge_model.backbone(images.tensor)
             if isinstance(features, tuple):
                 features = features[0]
-
             proposals, _ = self.edge_model.proposal_generator(images, features, None, eval=True)
-            pred_instances, predictions, box_features = self.edge_model.roi_heads._forward_box(
-                features, proposals, outs=True
-            )
-            results = self.edge_model.roi_heads.forward_with_given_boxes(features, pred_instances)
-
-        # 边端特征对齐适配（保持现有 TTA 逻辑）
-        if self.edge_optimizer is not None:
-            self.edge_optimizer.zero_grad()
-            adapt_losses = self.edge_model.adapt(batch)
-            if adapt_losses:
-                loss = sum(adapt_losses.values())
-                if isinstance(loss, torch.Tensor) and loss.requires_grad:
-                    loss.backward()
-                    self.edge_optimizer.step()
+            _, predictions, _ = self.edge_model.roi_heads._forward_box(features, proposals, outs=True)
 
         # 不确定性评估
         should_upload = False
         uncertainty = 0.0
         if self.cfg.TEST.ADAPTATION.ENABLE_CLOUD_EDGE and self.distill_trainer is not None:
             class_scores = torch.nn.functional.softmax(predictions[0], dim=1) if predictions else None
-            feat_mean, feat_var = extract_image_features(features)
+            feat_dict = extract_image_features(features)
 
             if class_scores is not None:
                 pred_cls = predictions[0].argmax(dim=1).tolist()
                 should_upload, uncertainty = self.uncertainty_sampler.should_upload(
                     class_scores=class_scores,
-                    feat_mean=feat_mean,
-                    feat_var=feat_var,
+                    feat_dict=feat_dict,
                     pred_classes=pred_cls,
                 )
 
@@ -244,8 +241,8 @@ class CloudEdgePipeline:
         try:
             def align_loss_fn(model, batch):
                 model.online_adapt = True
-                losses = model.adapt(batch)
-                return losses if losses else {}
+                _, adapt_losses, _ = model.adapt(batch)
+                return adapt_losses if adapt_losses else {}
 
             all_losses = self.distill_trainer.run_full_pipeline(
                 uploaded_batches=self.upload_queue,
@@ -312,38 +309,60 @@ def run_cloud_edge_adaptation(cfg, args):
     """云边协同适配主流程（仿真模式）"""
     from detectron2.engine.defaults import DefaultTrainer as DT
     from detectron2.evaluation import COCOEvaluator
+    from detectron2.modeling.configure_adaptation_model import configure_model
 
     pipeline = CloudEdgePipeline(cfg, args)
 
     results = OrderedDict()
 
-    # 针对每个测试域顺序运行
+    # 确定腐蚀域列表
     for dataset_name in cfg.DATASETS.TEST:
-        logger.info(f"\n{'='*60}")
-        logger.info(f"[CloudEdge] 开始处理域: {dataset_name}")
+        if 'coco' in dataset_name:
+            corruption_domains = ['brightness', 'defocus_blur', 'elastic_transform']
+        else:
+            corruption_domains = ['fog', 'rain', 'snow']
 
-        data_loader = DT.build_test_loader(cfg, dataset_name)
-        evaluator = COCOEvaluator(dataset_name, output_dir=cfg.OUTPUT_DIR)
-        evaluator.reset()
-        pipeline.uncertainty_sampler.reset_stats()
+        for d_idx, corrupt in enumerate(corruption_domains):
+            corrupt_dataset = f"{dataset_name}-{corrupt}"
+            logger.info(f"\n{'='*60}")
+            logger.info(f"[CloudEdge] 开始处理域: {corrupt_dataset} ({d_idx+1}/{len(corruption_domains)})")
 
-        for batch_idx, batch in enumerate(data_loader):
-            outputs, uploaded, uncertainty = pipeline.process_single_frame(batch)
-
-            # 评估
-            evaluator.process(batch, outputs)
-
-            if batch_idx % 100 == 0:
-                logger.info(
-                    f"[CloudEdge] {dataset_name}: {batch_idx}/{len(data_loader)} 帧 "
-                    f"| 上传率: {pipeline.uncertainty_sampler.get_upload_rate():.1%} "
-                    f"| 云端更新: {pipeline.cloud_update_count}"
+            # 非持续模式下每个域重置模型
+            if d_idx == 0 or not cfg.TEST.ADAPTATION.CONTINUAL:
+                pipeline.edge_model, pipeline.edge_optimizer, _ = configure_model(
+                    cfg, DefaultTrainer, revert=True
                 )
+                pipeline.edge_model.to(pipeline.device)
+                pipeline.edge_model.eval()
+                pipeline.edge_model.online_adapt = True
 
-        result = evaluator.evaluate()
-        results[dataset_name] = result
-        if comm.is_main_process():
-            logger.info(f"域 {dataset_name} 评估结果: {result}")
+            data_loader = DT.build_test_loader(cfg, corrupt_dataset)
+            evaluator = COCOEvaluator(corrupt_dataset, output_dir=cfg.OUTPUT_DIR)
+            evaluator.reset()
+            pipeline.uncertainty_sampler.reset_stats()
+
+            for batch_idx, batch in enumerate(data_loader):
+                outputs, uploaded, uncertainty = pipeline.process_single_frame(batch)
+
+                # detach + cpu for evaluation
+                for o in outputs:
+                    inst = o["instances"]
+                    inst.pred_boxes.tensor = inst.pred_boxes.tensor.detach().cpu()
+                    inst.scores = inst.scores.detach().cpu()
+                    inst.pred_classes = inst.pred_classes.detach().cpu()
+                evaluator.process(batch, outputs)
+
+                if batch_idx % 100 == 0:
+                    logger.info(
+                        f"[CloudEdge] {corrupt_dataset}: {batch_idx}/{len(data_loader)} 帧 "
+                        f"| 上传率: {pipeline.uncertainty_sampler.get_upload_rate():.1%} "
+                        f"| 云端更新: {pipeline.cloud_update_count}"
+                    )
+
+            result = evaluator.evaluate()
+            results[corrupt_dataset] = result
+            if comm.is_main_process():
+                logger.info(f"域 {corrupt_dataset} 评估结果: {result}")
 
     pipeline.print_stats()
     return results
