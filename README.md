@@ -1,8 +1,5 @@
 # 云边协同框架下持续动态的测试时自适应目标检测
 
-> **毕设论文实现代码**
-> 西安电子科技大学 · 电子信息（软件工程） · 2026年3月
->
 > 本项目基于 [natureyoo/ContinualTTA_ObjectDetection](https://github.com/natureyoo/ContinualTTA_ObjectDetection)（CVPR 2024）进行扩展，
 > 加入云边协同框架，解决边缘端在资源受限条件下的持续域适应问题。
 
