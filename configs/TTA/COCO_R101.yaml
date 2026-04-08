@@ -1,0 +1,26 @@
+_BASE_: "../Base/COCO_faster_rcnn_R101_FPN_1x.yaml"
+MODEL:
+  WEIGHTS: "./models/checkpoints/faster_rcnn_R101_coco.pth"
+SOLVER:
+  IMS_PER_BATCH_TEST: 4
+  BASE_LR: 0.001
+  CLIP_GRADIENTS:
+    ENABLED: True
+    CLIP_VALUE: 5.0
+TEST:
+  ONLINE_ADAPTATION: True
+  CONTINUAL_DOMAIN: True
+  ADAPTATION:
+    CONTINUAL: True
+    SOURCE_FEATS_PATH: "./models/stats/COCO_R101_stats.pt"
+    GLOBAL_ALIGN: "KL"
+    FOREGROUND_ALIGN: "KL"
+    ALPHA_GLOBAL: 1.0
+    ALPHA_FOREGROUND: 1.0
+    WEIGHT_REG: 0.0
+    TH_BG: 0.5
+    EMA_GAMMA: 128
+    FREQ_WEIGHT: True
+  ADAPTER:
+    TYPE: "parallel"
+OUTPUT_DIR: "./outputs/COCO_TTA/tmp"
