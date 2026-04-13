@@ -646,8 +646,11 @@ Alternatively, you can call evaluation functions yourself (see Colab balloon tut
                 feat_stats["kl_div"] = {}
                 for k in model.gl_features:
                     num = model.gl_features[k].shape[0]
-                    dist1 = torch.distributions.MultivariateNormal(model.gl_features[k].mean(dim=0), torch.cov(model.gl_features[k].T))
-                    dist2 = torch.distributions.MultivariateNormal(model.gl_features[k][:20, :].mean(dim=0), torch.cov(model.gl_features[k].T))
+                    eps = 1e-4
+                    cov_mat = torch.cov(model.gl_features[k].T)
+                    cov_mat = cov_mat + eps * torch.eye(cov_mat.shape[0], device=cov_mat.device)
+                    dist1 = torch.distributions.MultivariateNormal(model.gl_features[k].mean(dim=0), cov_mat)
+                    dist2 = torch.distributions.MultivariateNormal(model.gl_features[k][:20, :].mean(dim=0), cov_mat)
                     kl_div = (torch.distributions.kl.kl_divergence(dist1, dist2) + torch.distributions.kl.kl_divergence(dist1, dist2)) / 2
                     feat_stats["kl_div"][k] = kl_div
                     print("in-domain kl divergence: {:.3f}".format(kl_div.item()))
@@ -818,7 +821,10 @@ Alternatively, you can call evaluation functions yourself (see Colab balloon tut
             if wandb is not None:
                 wandb.log({'end-mAP': val_results['bbox']['AP'], 'end-mAP50': val_results['bbox']['AP50']}, step=int((d_idx + 2) * len(data_loader) * cfg.SOLVER.IMS_PER_BATCH_TEST))
                 model.online_adapt = False if cfg.TEST.ADAPTATION.TYPE == 'mean-teacher' else True
-        print('Online mAP50:{}'.format(','.join([results[k]['mAP50'] for k in results])))
+        if isinstance(results, dict) and 'bbox' in results:
+            print('Online mAP50:{}'.format(results['bbox']['AP50']))
+        else:
+            print('Online mAP50:{}'.format(','.join([str(results[k]['bbox']['AP50']) for k in results])))
         return results, backward_num
 
     @classmethod

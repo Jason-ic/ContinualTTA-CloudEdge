@@ -53,6 +53,7 @@ class GeneralizedRCNN(nn.Module):
         ema_gamma: int = 128,
         freq_weight: bool = False,
         skip_tau: float = 1.0,
+        th_bg: float = 0.5,
     ):
         """
         Args:
@@ -109,6 +110,7 @@ class GeneralizedRCNN(nn.Module):
         self.ema_gamma = ema_gamma
         self.freq_weight = freq_weight
         self.skip_tau = skip_tau
+        self.th_bg = th_bg
 
     @classmethod
     def from_config(cls, cfg):
@@ -132,6 +134,7 @@ class GeneralizedRCNN(nn.Module):
             "ema_gamma": cfg.TEST.ADAPTATION.EMA_GAMMA,
             "freq_weight": cfg.TEST.ADAPTATION.FREQ_WEIGHT,
             "skip_tau": cfg.TEST.ADAPTATION.SKIP_TAU,
+            "th_bg": cfg.TEST.ADAPTATION.TH_BG,
         }
 
     def initialize(self):
@@ -306,7 +309,7 @@ class GeneralizedRCNN(nn.Module):
             bg_scores = _scores[:, -1]
             fg_scores, fg_preds = _scores[:, :-1].max(dim=1)
 
-            valid = fg_scores >= 0.5
+            valid = fg_scores >= self.th_bg
             # self.class_th_adapt = torch.where(self.class_th_adapt < self.max_conf, self.class_th_adapt,
             #                                   torch.Tensor([self.max_conf]))
             fg_preds[~valid] = torch.ones((~valid).sum()).long().to(valid.device) * self.num_classes

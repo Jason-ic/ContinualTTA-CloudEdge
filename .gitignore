@@ -185,3 +185,7 @@ models/stats/
 thesis/*.pdf
 thisis2/*.pdf
 thisis3/*.pdf
+
+# Large data directories
+data/
+models/

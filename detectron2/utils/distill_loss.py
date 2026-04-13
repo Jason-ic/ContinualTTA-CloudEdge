@@ -175,7 +175,10 @@ class FeatureDistillLoss(nn.Module):
             if s_feat.shape != t_feat.shape:
                 s_feat = F.interpolate(s_feat, size=t_feat.shape[-2:], mode='bilinear', align_corners=False)
 
-            layer_loss = F.mse_loss(s_feat, t_feat)
+            # 按通道 L2 归一化后再算 MSE，避免特征幅值差异导致 loss 爆炸
+            s_norm = F.normalize(s_feat, dim=1)
+            t_norm = F.normalize(t_feat, dim=1)
+            layer_loss = F.mse_loss(s_norm, t_norm)
             if total_loss is None:
                 total_loss = layer_loss
             else:

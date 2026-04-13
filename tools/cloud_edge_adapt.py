@@ -25,6 +25,7 @@ import sys
 import time
 from collections import OrderedDict
 from pathlib import Path
+from typing import List, Optional
 
 import torch
 
@@ -37,6 +38,7 @@ from detectron2.data import build_detection_test_loader
 from detectron2.engine import DefaultTrainer, default_setup
 from detectron2.evaluation import COCOEvaluator, inference_on_dataset
 from detectron2.modeling import build_model
+from detectron2.modeling.meta_arch.rcnn import GeneralizedRCNN
 from detectron2.modeling.configure_adaptation_model import (
     configure_model,
     configure_cloud_edge_models,
@@ -116,7 +118,7 @@ class CloudEdgePipeline:
         os.makedirs(cfg.CLOUD_EDGE.CLOUD_DIR, exist_ok=True)
         os.makedirs(cfg.OUTPUT_DIR, exist_ok=True)
 
-        # 边端模型（R50）
+        # 边端模型（R50）— 多粒度特征对齐 + 云端参数精炼
         self.edge_model, self.edge_optimizer, _ = configure_model(
             cfg, DefaultTrainer, revert=True
         )
@@ -150,10 +152,16 @@ class CloudEdgePipeline:
         )
 
         # 双缓冲参数注入器
-        self.injector = DualBufferInjector(self.edge_model, device=self.device)
+        self.injector = DualBufferInjector(self.edge_model, device=self.device, ema_alpha=0.1)
 
         # 上传队列和统计
         self.upload_queue = []
+        # Sentinel 验证集：用于真实 mAP 评估（回滚判据），按域重建
+        self._sentinel_batches: List = []
+        self._sentinel_img_ids: List[int] = []
+        self._sentinel_evaluator = None
+        self._sentinel_dataset_name: Optional[str] = None
+        self.sentinel_size = 50
         self.cloud_update_interval = args.cloud_update_interval
         self.frame_count = 0
         self.cloud_update_count = 0
@@ -176,7 +184,7 @@ class CloudEdgePipeline:
         self.frame_count += 1
         self.stats['total_frames'] += 1
 
-        # 边端前向推理 + 特征对齐适配（adapt 返回 postprocessed results）
+        # 边端特征对齐适配 + 推理
         if self.edge_optimizer is not None:
             self.edge_optimizer.zero_grad()
 
@@ -195,7 +203,9 @@ class CloudEdgePipeline:
             if isinstance(features, tuple):
                 features = features[0]
             proposals, _ = self.edge_model.proposal_generator(images, features, None, eval=True)
-            _, predictions, _ = self.edge_model.roi_heads._forward_box(features, proposals, outs=True)
+            _, predictions, _ = self.edge_model.roi_heads._forward_box(
+                features, proposals, outs=True
+            )
 
         # 不确定性评估
         should_upload = False
@@ -227,6 +237,102 @@ class CloudEdgePipeline:
         self.stats['edge_adapt_time'] += time.time() - t0
         return results, should_upload, uncertainty
 
+    def _build_sentinel(self, dataset_name: str):
+        """
+        构建 sentinel 验证集（从 test loader 的前 N 张）用于教师真实 mAP 评估。
+        每个域第一次进入时构建一次，复用整个域。
+        """
+        if self._sentinel_dataset_name == dataset_name and self._sentinel_batches:
+            return
+        from detectron2.engine.defaults import DefaultTrainer as DT
+        from detectron2.evaluation import COCOEvaluator
+
+        logger.info(f"[CloudEdge] 构建 sentinel 验证集 ({dataset_name}, N={self.sentinel_size})...")
+        loader = DT.build_test_loader(self.cfg, dataset_name)
+        self._sentinel_batches = []
+        self._sentinel_img_ids = []
+        for i, batch in enumerate(loader):
+            if i >= self.sentinel_size:
+                break
+            self._sentinel_batches.append(batch)
+            for item in batch:
+                self._sentinel_img_ids.append(item["image_id"])
+        self._sentinel_evaluator = COCOEvaluator(
+            dataset_name, output_dir=os.path.join(self.cfg.OUTPUT_DIR, "sentinel")
+        )
+        self._sentinel_dataset_name = dataset_name
+        logger.info(f"[CloudEdge] sentinel 构建完成，共 {len(self._sentinel_batches)} batches, {len(self._sentinel_img_ids)} images")
+
+    def _evaluate_teacher_map(self, teacher_model) -> float:
+        """
+        在 sentinel 验证集上跑教师推理，用 COCOEvaluator 计算真实 AP50。
+        与论文 ROLLBACK_THRESHOLD=5.0 pp 语义一致。
+        """
+        if not self._sentinel_batches or self._sentinel_evaluator is None:
+            logger.warning("[CloudEdge] sentinel 未构建，跳过 mAP 评估")
+            return 0.0
+
+        self._sentinel_evaluator.reset()
+        teacher_model.eval()
+        prev_online = getattr(teacher_model, 'online_adapt', False)
+        teacher_model.online_adapt = False
+        # 暂时把 student 移 CPU 腾出显存给 teacher 跑 sentinel
+        if self.distill_trainer is not None:
+            self.distill_trainer.student.cpu()
+            torch.cuda.empty_cache()
+        try:
+            with torch.no_grad():
+                for batch in self._sentinel_batches:
+                    outputs = teacher_model(batch)
+                    self._sentinel_evaluator.process(batch, outputs)
+            result = self._sentinel_evaluator.evaluate(img_ids=self._sentinel_img_ids)
+        except Exception as e:
+            logger.error(f"[CloudEdge] sentinel mAP 评估失败: {e}")
+            return 0.0
+        finally:
+            teacher_model.online_adapt = prev_online
+            if self.distill_trainer is not None:
+                self.distill_trainer.student.to(self.device)
+
+        ap50 = 0.0
+        if result and 'bbox' in result:
+            ap50 = float(result['bbox'].get('AP50', 0.0))
+        logger.info(f"[CloudEdge] 教师 sentinel AP50 = {ap50:.2f}")
+        return ap50
+
+    def _evaluate_student_map(self, student_model) -> float:
+        """在 sentinel 上评估学生模型 AP50，用于注入前质量检查。"""
+        if not self._sentinel_batches or self._sentinel_evaluator is None:
+            return 0.0
+
+        self._sentinel_evaluator.reset()
+        student_model.to(self.device)
+        student_model.eval()
+        prev_online = getattr(student_model, 'online_adapt', False)
+        student_model.online_adapt = False
+
+        # 腾出显存：teacher 移 CPU
+        if self.distill_trainer is not None:
+            self.distill_trainer.teacher.cpu()
+            torch.cuda.empty_cache()
+        try:
+            with torch.no_grad():
+                for batch in self._sentinel_batches:
+                    outputs = student_model(batch)
+                    self._sentinel_evaluator.process(batch, outputs)
+            result = self._sentinel_evaluator.evaluate(img_ids=self._sentinel_img_ids)
+        except Exception as e:
+            logger.error(f"[CloudEdge] 学生 sentinel mAP 评估失败: {e}")
+            return 0.0
+        finally:
+            student_model.online_adapt = prev_online
+
+        ap50 = 0.0
+        if result and 'bbox' in result:
+            ap50 = float(result['bbox'].get('AP50', 0.0))
+        logger.info(f"[CloudEdge] 学生 sentinel AP50 = {ap50:.2f}")
+        return ap50
+
     def _trigger_cloud_update(self):
         """触发云端双模型蒸馏更新"""
         if not self.upload_queue:
@@ -239,26 +345,44 @@ class CloudEdgePipeline:
         t0 = time.time()
 
         try:
+            # 同步边端当前权重到云端学生（特别是 box_predictor）
+            edge_state = self.edge_model.state_dict()
+            student_state = self.distill_trainer.student.state_dict()
+            synced = 0
+            for k in student_state:
+                if k in edge_state and student_state[k].shape == edge_state[k].shape:
+                    student_state[k] = edge_state[k].cpu().clone()
+                    synced += 1
+            self.distill_trainer.student.load_state_dict(student_state)
+            logger.info(f"[CloudEdge] 同步边端→云端学生 {synced} 个参数")
+
+            # 云端更新期间暂时释放边端模型显存
+            self.edge_model.cpu()
+            torch.cuda.empty_cache()
+
             def align_loss_fn(model, batch):
                 model.online_adapt = True
                 _, adapt_losses, _ = model.adapt(batch)
                 return adapt_losses if adapt_losses else {}
 
+            # 使用 sentinel 真实 mAP 评估作为回滚判据（论文 Chapter 5）
             all_losses = self.distill_trainer.run_full_pipeline(
                 uploaded_batches=self.upload_queue,
                 align_loss_fn=align_loss_fn,
+                val_map_fn=self._evaluate_teacher_map,
             )
             logger.info(f"[CloudEdge] 云端更新完成，损失: {all_losses}")
 
-            # 导出学生模型参数到共享目录
+            # 导出学生模型参数（只有 box_predictor 被蒸馏修改）
             param_path = os.path.join(
                 self.cfg.CLOUD_EDGE.CLOUD_DIR,
                 f"student_update_{self.cloud_update_count:04d}.pt"
             )
             export_student_fp16(self.distill_trainer.student, param_path)
 
-            # 触发边端异步参数加载
+            # 注入到边端（DualBuffer 只注入 box_predictor 键，EMA α=0.3）
             self.injector.prepare_next(param_path)
+            logger.info(f"[CloudEdge] box_predictor 参数已下发")
 
             self.cloud_update_count += 1
             self.stats['cloud_updates'] += 1
@@ -266,7 +390,12 @@ class CloudEdgePipeline:
 
         except Exception as e:
             logger.error(f"[CloudEdge] 云端更新失败: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
+            # 恢复边端模型到 GPU
+            self.edge_model.to(self.device)
+            torch.cuda.empty_cache()
             # 清空上传队列（保留最新 10 帧防止冷启动）
             self.upload_queue = self.upload_queue[-10:]
 
@@ -293,6 +422,7 @@ def run_evaluation(cfg, args):
         cfg.MODEL.WEIGHTS, resume=False
     )
     model.eval()
+    model.online_adapt = False
 
     results = OrderedDict()
     for dataset_name in cfg.DATASETS.TEST:
@@ -327,19 +457,28 @@ def run_cloud_edge_adaptation(cfg, args):
             logger.info(f"\n{'='*60}")
             logger.info(f"[CloudEdge] 开始处理域: {corrupt_dataset} ({d_idx+1}/{len(corruption_domains)})")
 
-            # 非持续模式下每个域重置模型
-            if d_idx == 0 or not cfg.TEST.ADAPTATION.CONTINUAL:
+            # 每个域重置edge模型和云端teacher LoRA
+            if d_idx > 0:
                 pipeline.edge_model, pipeline.edge_optimizer, _ = configure_model(
                     cfg, DefaultTrainer, revert=True
                 )
                 pipeline.edge_model.to(pipeline.device)
                 pipeline.edge_model.eval()
                 pipeline.edge_model.online_adapt = True
+                # 重置云端teacher LoRA和student权重
+                if pipeline.distill_trainer is not None:
+                    pipeline.distill_trainer = configure_cloud_edge_models(cfg, DefaultTrainer)
+                # 重置upload队列和更新计数
+                pipeline.upload_queue = []
+                pipeline.cloud_update_count = 0
 
             data_loader = DT.build_test_loader(cfg, corrupt_dataset)
             evaluator = COCOEvaluator(corrupt_dataset, output_dir=cfg.OUTPUT_DIR)
             evaluator.reset()
             pipeline.uncertainty_sampler.reset_stats()
+            # 为当前域构建 sentinel（教师 mAP 评估用）
+            if pipeline.distill_trainer is not None:
+                pipeline._build_sentinel(corrupt_dataset)
 
             for batch_idx, batch in enumerate(data_loader):
                 outputs, uploaded, uncertainty = pipeline.process_single_frame(batch)

@@ -196,6 +196,26 @@ def configure_cloud_edge_models(cfg, trainer):
     # 若云端模型权重已指定则使用，否则复用边端权重
     if cfg.TEST.ADAPTATION.CLOUD_MODEL_WEIGHTS is not None:
         teacher_cfg.MODEL.WEIGHTS = cfg.TEST.ADAPTATION.CLOUD_MODEL_WEIGHTS
+    # 教师必须用对应 backbone 的 source stats（R101 stats），
+    # 不能复用 R50 stats，否则 LoRA 适配方向是错的
+    cloud_stats_path = getattr(cfg.TEST.ADAPTATION, 'CLOUD_SOURCE_FEATS_PATH', None)
+    if cloud_stats_path:
+        teacher_cfg.TEST.ADAPTATION.SOURCE_FEATS_PATH = cloud_stats_path
+    else:
+        import logging
+        logging.getLogger(__name__).warning(
+            "[CloudEdge] CLOUD_SOURCE_FEATS_PATH 未设置，教师 R101 将复用 R50 stats，"
+            "这会导致 LoRA 特征对齐方向错误！"
+        )
+    # 教师模型不需要 adapter（adapter 是边端在线适配用的），
+    # 否则 R101 checkpoint 不含 adapter 权重，随机初始化的 adapter 会破坏特征输出
+    teacher_cfg.TEST.ADAPTATION.WHERE = "none"
+    teacher_cfg.TEST.ONLINE_ADAPTATION = False
+
+    import logging as _lg
+    _lg.getLogger(__name__).info(
+        f"[CloudEdge] 教师 R101 使用 source stats: {teacher_cfg.TEST.ADAPTATION.SOURCE_FEATS_PATH}"
+    )
     teacher_cfg.freeze()
 
     teacher_model = trainer.build_model(teacher_cfg)
@@ -206,12 +226,6 @@ def configure_cloud_edge_models(cfg, trainer):
     teacher_model.eval()
     teacher_model.requires_grad_(False)
     teacher_model.initialize()
-
-    # 保存一份冻结的预训练教师（用于防遗忘正则）
-    pretrain_teacher = copy.deepcopy(teacher_model)
-    pretrain_teacher.to(device)
-    pretrain_teacher.eval()
-    pretrain_teacher.requires_grad_(False)
 
     # 注入 LoRA
     lora_rank = 16
@@ -233,15 +247,29 @@ def configure_cloud_edge_models(cfg, trainer):
     student_model.requires_grad_(True)
     student_model.initialize()
 
+    # 推断 FPN 输出通道，用于启用特征蒸馏（两侧 FPN 通常都是 256）
+    def _fpn_channels(m):
+        out = {}
+        try:
+            shapes = m.backbone.output_shape()
+            for k, v in shapes.items():
+                out[k] = v.channels
+        except Exception:
+            pass
+        return out
+
+    student_channels = _fpn_channels(student_model)
+    teacher_channels = _fpn_channels(teacher_model)
+
     # --- 构建 CloudDistillationTrainer ---
     distill_trainer = CloudDistillationTrainer(
         teacher_model=teacher_model,
         student_model=student_model,
-        pretrain_teacher=pretrain_teacher,
+        pretrain_teacher=None,
         teacher_lr=cfg.TEST.ADAPTATION.CLOUD_LORA_LR,
         teacher_weight_decay=1e-4,
         student_lr=cfg.TEST.ADAPTATION.DISTILL_LR,
-        teacher_epochs=max(1, cfg.TEST.ADAPTATION.CLOUD_ITERATIONS // 100),
+        teacher_epochs=cfg.TEST.ADAPTATION.CLOUD_ITERATIONS,
         student_epochs=cfg.TEST.ADAPTATION.DISTILL_EPOCHS,
         forgetting_beta=getattr(cfg.TEST.ADAPTATION, 'FORGETTING_BETA', 0.3),
         rollback_threshold=getattr(cfg.TEST.ADAPTATION, 'ROLLBACK_THRESHOLD', 5.0),
@@ -250,6 +278,8 @@ def configure_cloud_edge_models(cfg, trainer):
         lambda_feat=cfg.TEST.ADAPTATION.LAMBDA_FEATURE,
         distill_temperature=cfg.TEST.ADAPTATION.DISTILL_TEMPERATURE,
         lora_rank=lora_rank,
+        student_channels=student_channels,
+        teacher_channels=teacher_channels,
     )
     # teacher LoRA 优化器已通过 inject_lora 完成，这里直接设置
     distill_trainer.teacher_optimizer = torch.optim.AdamW(

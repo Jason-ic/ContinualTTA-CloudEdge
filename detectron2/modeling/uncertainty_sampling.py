@@ -214,25 +214,26 @@ class UncertaintySampler:
 
         # 6. 判断是否上传
         if uncertainty >= threshold:
-            # 7. 类均衡约束
-            if pred_classes is not None:
+            # 7. 类均衡约束（论文 alpha_c = max(1, n̄/(n_c+eps))）：
+            # 只要当前帧中存在任一"未超 cap"的预测类别即允许上传，
+            # 稀有类的 cap 更大，从而优先获得上传机会。
+            # 若所有出现的类别均已达到 cap，则阻断该帧。
+            if pred_classes is not None and len(pred_classes) > 0:
                 caps = self._class_balanced_cap(pred_classes)
-                # 检查主要预测类别是否超出上限
                 from collections import Counter
                 class_counts = Counter(pred_classes)
-                upload_blocked = False
-                for c, cnt in class_counts.items():
-                    if 0 <= c < self.num_classes:
-                        if self.class_upload_counts[c] >= caps[c]:
-                            upload_blocked = True
-                            break
-                if upload_blocked:
+
+                valid_classes = [
+                    c for c in class_counts
+                    if 0 <= c < self.num_classes
+                    and self.class_upload_counts[c] < caps[c]
+                ]
+                if len(valid_classes) == 0:
                     return False, uncertainty
 
-                # 更新类别计数
-                for c, cnt in class_counts.items():
-                    if 0 <= c < self.num_classes:
-                        self.class_upload_counts[c] += 1
+                # 只给"未超 cap"的类别计数 +1，避免进一步放大已饱和类
+                for c in valid_classes:
+                    self.class_upload_counts[c] += 1
 
             self.total_uploaded += 1
             return True, uncertainty

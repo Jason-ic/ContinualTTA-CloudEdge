@@ -50,10 +50,21 @@ def export_student_fp16(
     """
     os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
 
-    # 转为 FP16 state_dict
+    # Bug C 修复（修正版）：导出 parameters + BN 的 weight/bias buffers，
+    # 但排除 running_mean/running_var/num_batches_tracked（边端自适应统计不应覆盖）。
+    # FrozenBatchNorm2d 将 weight/bias 注册为 buffer 而非 parameter，
+    # 若不导出则注入后 Conv 权重与 BN 参数不匹配，模型崩溃。
+    skip_suffixes = ('running_mean', 'running_var', 'num_batches_tracked')
+    # 排除 adapter 参数：边端 adapter 经过在线适配有意义的状态，
+    # 云端学生的 adapter 是随机初始化的，注入会覆盖边端适配进度
+    skip_keywords = ('adapter',)
     fp16_state = {}
-    for key, param in model.state_dict().items():
-        fp16_state[key] = param.half()
+    for key, val in model.state_dict().items():
+        if any(key.endswith(s) for s in skip_suffixes):
+            continue
+        if any(k in key for k in skip_keywords):
+            continue
+        fp16_state[key] = val.detach().half().cpu()
 
     # 先写临时文件再 rename，避免并发写入 crash
     tmp_path = save_path + '.tmp'
@@ -150,9 +161,10 @@ class DualBufferInjector:
         injector.try_swap()                     # 若新参数已就绪则切换
     """
 
-    def __init__(self, model: nn.Module, device: str = 'cpu'):
+    def __init__(self, model: nn.Module, device: str = 'cpu', ema_alpha: float = 0.01):
         self.model = model
         self.device = device
+        self.ema_alpha = ema_alpha  # EMA 混合系数：edge = (1-α)*edge + α*cloud
         self._lock = threading.Lock()
         self._next_state: Optional[Dict[str, torch.Tensor]] = None
         self._next_ready = False
@@ -199,15 +211,24 @@ class DualBufferInjector:
             self._next_state = None
             self._next_ready = False
 
-        # 加载新参数（CPU 上无需 cuda 同步）
-        missing, unexpected = self.model.load_state_dict(next_state, strict=False)
-        if missing:
-            logger.debug(f"[DualBuffer] 缺少参数键: {missing[:5]}")
-        if unexpected:
-            logger.debug(f"[DualBuffer] 多余参数键: {unexpected[:5]}")
+        # 只注入 box_predictor 参数，EMA 混合避免破坏边端适配状态
+        current_state = self.model.state_dict()
+        alpha = self.ema_alpha
+        injected = 0
+        for key, cloud_val in next_state.items():
+            if 'box_predictor' not in key:
+                continue
+            if key not in current_state:
+                continue
+            edge_val = current_state[key]
+            if cloud_val.shape == edge_val.shape and cloud_val.is_floating_point():
+                current_state[key] = (1 - alpha) * edge_val + alpha * cloud_val.to(edge_val.device)
+                injected += 1
+        self.model.load_state_dict(current_state)
+        logger.info(f"[DualBuffer] EMA 注入 {injected} 个 box_predictor 参数 (α={alpha})")
 
         self._swap_count += 1
-        logger.info(f"[DualBuffer] 参数切换完成 (第 {self._swap_count} 次)")
+        logger.info(f"[DualBuffer] 参数替换完成 (第 {self._swap_count} 次)")
         return True
 
     def inject_sync(self, param_path: str, target_dtype: torch.dtype = torch.float32) -> None:

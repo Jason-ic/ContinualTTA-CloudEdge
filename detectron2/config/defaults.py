@@ -695,6 +695,9 @@ _C.TEST.ADAPTATION.ENABLE_CLOUD_EDGE = False
 _C.TEST.ADAPTATION.EDGE_MODEL = "R50"
 _C.TEST.ADAPTATION.CLOUD_MODEL = "R101"
 _C.TEST.ADAPTATION.CLOUD_MODEL_WEIGHTS = None
+# 教师模型独立的 source feature stats 路径（必须用对应 backbone 的 stats，
+# 否则教师 LoRA 适配会被错误的统计目标毒化）
+_C.TEST.ADAPTATION.CLOUD_SOURCE_FEATS_PATH = None
 
 # Sample Selection (Edge-side)
 _C.TEST.ADAPTATION.SELECTION_BUDGET = 200
