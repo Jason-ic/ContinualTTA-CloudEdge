@@ -15,7 +15,6 @@ Cloud-Edge Collaborative Continual TTA Object Detection - Full Pipeline
     MODEL.WEIGHTS ./outputs/coco_base_r50/model_final.pth \\
     OUTPUT_DIR ./outputs/CloudEdge_test
 
-详细说明参见 R101_README.md
 """
 
 import argparse
